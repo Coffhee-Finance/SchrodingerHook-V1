@@ -1,0 +1,50 @@
+{
+  "lib/cofhe-contracts": {
+    "tag": {
+      "name": "v0.1.4",
+      "rev": "5fe6f5e6aeb07a9fb329970491e8ad022120d1ad"
+    }
+  },
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.16.2",
+      "rev": "bf647bd6046f2f7da30d0c2bf435e5c76a780c1b"
+    }
+  },
+  "lib/hyperlane-monorepo": {
+    "tag": {
+      "name": "v1.5.8",
+      "rev": "dc89ee1558f437b5937f9f4694e04048330a990f"
+    }
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+    }
+  },
+  "lib/permit2": {
+    "rev": "cc56ad0f3439c502c246fc5cfcc3db92bb8b7219"
+  },
+  "lib/reactive-lib": {
+    "tag": {
+      "name": "v0.2.0",
+      "rev": "d664678a7d86204c9391af4cedfd5ae0b0b904e4"
+    }
+  },
+  "lib/usingtellor": {
+    "tag": {
+      "name": "v5.0.4",
+      "rev": "cfc56240e0f753f452d2f376b5ab126fa95222ad"
+    }
+  },
+  "lib/v4-core": {
+    "tag": {
+      "name": "v4.0.0",
+      "rev": "e50237c43811bd9b526eff40f26772152a42daba"
+    }
+  },
+  "lib/v4-periphery": {
+    "rev": "3245c3cb99c48fa1dc2459c3b60abc37d4294aba"
+  }
+}

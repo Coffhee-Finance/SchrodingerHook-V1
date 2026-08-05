@@ -1,0 +1,94 @@
+[profile.default]
+# ------------------------------------------------------------------
+# Project paths
+# ------------------------------------------------------------------
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+cache_path = "cache"
+
+# ------------------------------------------------------------------
+# Solidity compiler
+# ------------------------------------------------------------------
+solc_version = "0.8.26"
+evm_version = "cancun"
+
+# ------------------------------------------------------------------
+# Optimize for smaller deployed bytecode
+# ------------------------------------------------------------------
+optimizer = true
+optimizer_runs = 1
+via_ir = true
+
+bytecode_hash = "none"
+cbor_metadata = false
+
+# ------------------------------------------------------------------
+# Foundry behavior
+# ------------------------------------------------------------------
+ffi = true
+verbosity = 3
+
+fs_permissions = [
+    { access = "read-write", path = "./" }
+]
+
+# ------------------------------------------------------------------
+# Solidity import remappings
+# ------------------------------------------------------------------
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    "forge-std/=lib/forge-std/src/",
+    "cofhe-contracts/=lib/cofhe-contracts/contracts/",
+    "reactive-lib/=lib/reactive-lib/src/",
+    "usingtellor/=lib/usingtellor/contracts/",
+    "hyperlane-monorepo/=lib/hyperlane-monorepo/"
+]
+
+# ------------------------------------------------------------------
+# Fuzz testing
+# ------------------------------------------------------------------
+[profile.default.fuzz]
+runs = 256
+
+# ------------------------------------------------------------------
+# Invariant testing
+# ------------------------------------------------------------------
+[profile.default.invariant]
+runs = 64
+depth = 100
+
+# ------------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------------
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+multiline_func_header = "attributes_first"
+quote_style = "double"
+number_underscore = "thousands"
+wrap_comments = true
+
+# ------------------------------------------------------------------
+# RPC endpoints
+# ------------------------------------------------------------------
+[rpc_endpoints]
+arbitrumSepolia = "${ARBITRUM_SEPOLIA_RPC}"
+arbitrum = "${ARBITRUM_RPC}"
+ethereum = "${ETHEREUM_RPC}"
+base = "${BASE_RPC}"
+
+# ------------------------------------------------------------------
+# Explorer verification
+# ------------------------------------------------------------------
+[etherscan]
+arbitrumSepolia = { key = "${ARBISCAN_API_KEY}" }
+arbitrum = { key = "${ARBISCAN_API_KEY}" }
+ethereum = { key = "${ETHERSCAN_API_KEY}" }
+base = { key = "${BASESCAN_API_KEY}" }
