@@ -1,25 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/**
- * @title SchrodingerHook
- * @notice Confidential strategy and private-rebalancing coordinator for two
- *         strictly separated Coffhee Finance market families:
- *
- *         1. eToken markets: hybrid ERC20 + ERC7984 currencies in Uniswap v4.
- *         2. eAsset markets: encrypted ERC1155 positions backed by ERC3475.
- *
- * @dev Strategy inputs, exposure, drift, thresholds, and approvals remain as
- *      Fhenix CoFHE ciphertext handles. Uniswap v4 liquidity modifications are
- *      executed through PoolManager.unlock(). eAsset markets never enter a
- *      Uniswap PoolKey and cannot be mixed with eToken markets.
- *
- *      Tellor, Reactive Network, and Hyperlane should connect through approved
- *      local adapter/receiver contracts. Cross-chain authentication belongs in
- *      the Hyperlane receiver; oracle verification belongs in the Tellor
- *      adapter. This contract remains the final policy and replay boundary.
- */
-
 import {
     FHE,
     ebool,
@@ -43,38 +24,76 @@ import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockC
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+
 import {
     SwapParams,
     ModifyLiquidityParams
 } from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
 import {
     BeforeSwapDelta,
     BeforeSwapDeltaLibrary
 } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+
 import {
     BalanceDelta,
     BalanceDeltaLibrary
 } from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 
-interface IERC7984Minimal is IERC165 {
-    function confidentialBalanceOf(address account) external view returns (euint64);
-}
+import {
+    IPermissionsAdapter
+} from "@uniswap/v4-periphery/src/hooks/permissionedPools/interfaces/IPermissionsAdapter.sol";
 
-interface IEncryptedERC1155 is IERC165, IERC1155 {
-    function confidentialBalanceOf(address account, uint256 tokenId)
+import {
+    IPermissionsAdapterFactory
+} from "@uniswap/v4-periphery/src/hooks/permissionedPools/interfaces/IPermissionsAdapterFactory.sol";
+
+import {
+    IAllowlistChecker
+} from "@uniswap/v4-periphery/src/hooks/permissionedPools/interfaces/IAllowlistChecker.sol";
+
+import {
+    PermissionFlag,
+    PermissionFlags
+} from "@uniswap/v4-periphery/src/hooks/permissionedPools/libraries/PermissionFlags.sol";
+
+
+interface IERC7984Minimal is IERC165 {
+    function confidentialBalanceOf(
+        address account
+    )
         external
         view
         returns (euint64);
 }
 
-interface IERC3475Backing is IERC165 {
-    function getProgress(uint256 classId, uint256 nonceId)
+
+interface IEncryptedERC1155 is IERC165, IERC1155 {
+    function confidentialBalanceOf(
+        address account,
+        uint256 tokenId
+    )
         external
         view
-        returns (uint256 progressAchieved, uint256 progressRemaining);
+        returns (euint64);
 }
 
-// ArbSepolia Address: 0xec25EcE12943397E6DB17A24340BF3DBaaa440c0
+
+interface IERC3475Backing is IERC165 {
+    function getProgress(
+        uint256 classId,
+        uint256 nonceId
+    )
+        external
+        view
+        returns (
+            uint256 progressAchieved,
+            uint256 progressRemaining
+        );
+}
+
+// EthSepolia Address: 0x05D0E9Df9e6FB6e6348290cbF2acE40142B568c0
+
 
 contract SchrodingerHook is
     IHooks,
@@ -88,34 +107,53 @@ contract SchrodingerHook is
     using CurrencyLibrary for Currency;
     using BalanceDeltaLibrary for BalanceDelta;
 
-    /// @notice Canonical Uniswap v4 PoolManager authorized to invoke hook callbacks.
     IPoolManager public immutable poolManager;
 
     uint8 public constant MAX_ASSETS = 8;
     uint64 public constant BPS = 10_000;
 
-    // ERC-7984 currently publishes this ERC-165 identifier. Keep configurable
-    // in a later registry if the implementation used by Fhenix changes.
-    bytes4 public constant ERC7984_INTERFACE_ID = 0x4958f2a4;
+    bytes4 public constant ERC7984_INTERFACE_ID =
+        0x4958f2a4;
+
     bytes4 public constant ENCRYPTED_1155_INTERFACE_ID =
         type(IEncryptedERC1155).interfaceId;
+
     bytes4 public constant ERC3475_BACKING_INTERFACE_ID =
         type(IERC3475Backing).interfaceId;
 
-    uint256 public constant CAP_BEFORE_SWAP = 1 << 0;
-    uint256 public constant CAP_AFTER_SWAP = 1 << 1;
-    uint256 public constant CAP_TEMPORARY_LIQUIDITY = 1 << 2;
-    uint256 public constant CAP_PERSISTENT_LIQUIDITY = 1 << 3;
-    uint256 public constant CAP_EXTERNAL_HEDGE = 1 << 4;
-    uint256 public constant CAP_EASSET_REBALANCE = 1 << 5;
-    uint256 public constant CAP_BOND_SETTLEMENT = 1 << 6;
-    uint256 public constant CAP_CROSS_CHAIN = 1 << 7;
-    uint256 public constant CAP_ORACLE_REFRESH = 1 << 8;
+    uint256 public constant CAP_BEFORE_SWAP =
+        1 << 0;
+
+    uint256 public constant CAP_AFTER_SWAP =
+        1 << 1;
+
+    uint256 public constant CAP_TEMPORARY_LIQUIDITY =
+        1 << 2;
+
+    uint256 public constant CAP_PERSISTENT_LIQUIDITY =
+        1 << 3;
+
+    uint256 public constant CAP_EXTERNAL_HEDGE =
+        1 << 4;
+
+    uint256 public constant CAP_EASSET_REBALANCE =
+        1 << 5;
+
+    uint256 public constant CAP_BOND_SETTLEMENT =
+        1 << 6;
+
+    uint256 public constant CAP_ORACLE_REFRESH =
+        1 << 8;
 
     enum MarketType {
         UNSET,
         ETOKEN,
         EASSET
+    }
+
+    enum AccessMode {
+        PERMISSIONLESS,
+        PERMISSIONED
     }
 
     enum StrategyKind {
@@ -133,24 +171,6 @@ contract SchrodingerHook is
         PERSISTENT,
         HEDGE_ONLY,
         SETTLEMENT_ONLY
-    }
-
-    enum AutomationAction {
-        NONE,
-        PRICE_UPDATE,
-        COLLATERAL_UPDATE,
-        ARM_PLAN,
-        DISARM_PLAN,
-        EXECUTE_ETOKEN_REBALANCE,
-        EXECUTE_EASSET_REBALANCE,
-        HEDGE_REQUEST,
-        HEDGE_COMPLETE,
-        POSITION_SETTLEMENT,
-        PAUSE_MARKET,
-        UNPAUSE_MARKET,
-        REFRESH_RISK,
-        ORACLE_DEGRADED,
-        ORACLE_RECOVERED
     }
 
     enum UnlockAction {
@@ -182,16 +202,19 @@ contract SchrodingerHook is
         bool armed;
         uint8 assetCount;
         uint64 lastSignalAt;
+
         mapping(uint8 => euint64) targetBps;
         mapping(uint8 => euint64) exposure;
         mapping(uint8 => euint64) drift;
         mapping(uint8 => euint64) lastRebalanceDelta;
+
         euint64 rebalanceThresholdBps;
         euint64 maximumAllocation;
         euint64 hedgeIntensityBps;
         euint64 volatilityBps;
         euint64 feeAprBps;
         euint64 timingSeed;
+
         ebool complianceEnabled;
         ebool lastExecutionApproved;
     }
@@ -201,6 +224,7 @@ contract SchrodingerHook is
         bool paused;
         bytes32 planId;
         uint8 assetIndex;
+        AccessMode accessMode;
         address token0;
         address token1;
         int24 defaultTickLower;
@@ -213,6 +237,8 @@ contract SchrodingerHook is
         bool paused;
         bytes32 planId;
         uint8 assetIndex;
+        AccessMode accessMode;
+        IAllowlistChecker allowlistChecker;
         address positionToken;
         uint256 positionTokenId;
         address backingBond;
@@ -235,17 +261,41 @@ contract SchrodingerHook is
         bytes32 positionSalt;
     }
 
-    mapping(bytes32 => ExecutionPlan) private _plans;
-    mapping(PoolId => ETokenMarket) public eTokenMarkets;
-    mapping(bytes32 => EAssetMarket) private _eAssetMarkets;
-    mapping(address => bool) public approvedEToken;
-    mapping(address => bool) public approvedEAssetToken;
-    mapping(address => bool) public approvedBondContract;
-    mapping(address => bool) public approvedProtocolModule;
-    mapping(bytes32 => bool) public processedExecutions;
-    mapping(bytes32 => bool) public oracleDegraded;
+    mapping(bytes32 => ExecutionPlan)
+        private _plans;
+
+    mapping(PoolId => ETokenMarket)
+        public eTokenMarkets;
+
+    mapping(bytes32 => EAssetMarket)
+        private _eAssetMarkets;
+
+    mapping(address => bool)
+        public approvedEToken;
+
+    mapping(address => bool)
+        public approvedEAssetToken;
+
+    mapping(address => bool)
+        public approvedBondContract;
+
+    mapping(address => bool)
+        public approvedProtocolModule;
+
+    mapping(bytes32 => bool)
+        public processedExecutions;
+
+    mapping(bytes32 => bool)
+        public oracleDegraded;
+
+    mapping(bytes32 => bytes32)
+        public eAssetMarketByPosition;
+
+    IPermissionsAdapterFactory
+        public permissionsAdapterFactory;
 
     bool public globalPaused;
+
     uint256 private _planNonce;
 
     event PlanCreated(
@@ -256,8 +306,16 @@ contract SchrodingerHook is
         ExecutionMode executionMode,
         uint256 capabilities
     );
-    event PlanArmed(bytes32 indexed planId, bool armed);
-    event PlanDeactivated(bytes32 indexed planId);
+
+    event PlanArmed(
+        bytes32 indexed planId,
+        bool armed
+    );
+
+    event PlanDeactivated(
+        bytes32 indexed planId
+    );
+
     event ETokenMarketCreated(
         PoolId indexed poolId,
         bytes32 indexed planId,
@@ -265,6 +323,7 @@ contract SchrodingerHook is
         address token1,
         uint8 assetIndex
     );
+
     event EAssetMarketCreated(
         bytes32 indexed marketId,
         bytes32 indexed planId,
@@ -273,11 +332,13 @@ contract SchrodingerHook is
         address backingBond,
         address settlementEToken
     );
+
     event PrivateRebalanceEvaluated(
         bytes32 indexed planId,
         bytes32 indexed marketRef,
         MarketType marketType
     );
+
     event ETokenRebalanceExecuted(
         PoolId indexed poolId,
         bytes32 indexed planId,
@@ -286,18 +347,13 @@ contract SchrodingerHook is
         int128 amount0,
         int128 amount1
     );
+
     event EAssetRebalanceRecorded(
         bytes32 indexed marketId,
         bytes32 indexed planId,
         bytes32 indexed executionId
     );
-    event AutomationHandled(
-        AutomationAction indexed action,
-        bytes32 indexed marketRef,
-        bytes32 indexed planId,
-        bytes32 executionId,
-        bytes32 payloadHash
-    );
+
     event OracleSignalReceived(
         bytes32 indexed marketRef,
         bytes32 indexed planId,
@@ -305,11 +361,50 @@ contract SchrodingerHook is
         uint256 value,
         uint256 timestamp
     );
-    event ProtocolModuleSet(address indexed module, bool approved);
-    event ETokenApprovalSet(address indexed token, bool approved);
-    event EAssetTokenApprovalSet(address indexed token, bool approved);
-    event BondApprovalSet(address indexed bond, bool approved);
-    event AuditorAccessGranted(bytes32 indexed planId, address indexed auditor, uint8 asset);
+
+    event ProtocolModuleSet(
+        address indexed module,
+        bool approved
+    );
+
+    event ETokenApprovalSet(
+        address indexed token,
+        bool approved
+    );
+
+    event EAssetTokenApprovalSet(
+        address indexed token,
+        bool approved
+    );
+
+    event BondApprovalSet(
+        address indexed bond,
+        bool approved
+    );
+
+    event PermissionsAdapterFactorySet(
+        address indexed factory
+    );
+
+    event ETokenAccessModeSet(
+        PoolId indexed poolId,
+        AccessMode indexed accessMode,
+        address token0,
+        address token1
+    );
+
+    event EAssetAccessModeSet(
+        bytes32 indexed marketId,
+        AccessMode indexed accessMode,
+        address indexed allowlistChecker
+    );
+
+    event PermissionedSwapObserved(
+        PoolId indexed poolId,
+        address indexed approvedWrapper,
+        address token0,
+        address token1
+    );
 
     error InvalidAddress();
     error InvalidPlan();
@@ -335,41 +430,105 @@ contract SchrodingerHook is
     error InvalidTicks();
     error InvalidLiquidityDelta();
     error NotPlanOwner();
-    error UnsupportedAutomationAction();
+    error PermissionedFactoryNotConfigured();
+    error PermissionedAdapterRequired();
+
+    error UnverifiedPermissionsAdapter(
+        address adapter
+    );
+
+    error PermissionedWrapperNotAllowed(
+        address adapter,
+        address wrapper
+    );
+
+    error PermissionedSwappingDisabled(
+        address adapter
+    );
+
+    error InvalidAllowlistChecker(
+        address checker
+    );
+
+    error PermissionDenied(
+        address account,
+        address asset,
+        bytes2 requiredPermission
+    );
 
     modifier onlyProtocolModule() {
-        if (!approvedProtocolModule[msg.sender]) revert OnlyProtocolModule();
+        if (!approvedProtocolModule[msg.sender]) {
+            revert OnlyProtocolModule();
+        }
+
         _;
     }
 
-    modifier onlyPlanOwner(bytes32 planId) {
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.owner == address(0)) revert InvalidPlan();
-        if (plan.owner != msg.sender) revert NotPlanOwner();
+    modifier onlyPlanOwner(
+        bytes32 planId
+    ) {
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (plan.owner == address(0)) {
+            revert InvalidPlan();
+        }
+
+        if (plan.owner != msg.sender) {
+            revert NotPlanOwner();
+        }
+
         _;
     }
 
-    constructor(IPoolManager manager, address initialOwner)
+    modifier onlyPoolManager() {
+        if (
+            msg.sender
+                != address(poolManager)
+        ) {
+            revert OnlyPoolManager();
+        }
+
+        _;
+    }
+
+    constructor(
+        IPoolManager manager,
+        address initialOwner
+    )
         Ownable(initialOwner)
     {
-        if (address(manager) == address(0) || initialOwner == address(0)) {
+        if (
+            address(manager) == address(0)
+                || initialOwner == address(0)
+        ) {
             revert InvalidAddress();
         }
 
-        poolManager = manager;
-        approvedProtocolModule[initialOwner] = true;
-        emit ProtocolModuleSet(initialOwner, true);
+        poolManager =
+            manager;
+
+        approvedProtocolModule[
+            initialOwner
+        ] = true;
+
+        emit ProtocolModuleSet(
+            initialOwner,
+            true
+        );
     }
 
     function getHookPermissions()
         public
         pure
-        returns (Hooks.Permissions memory)
+        returns (
+            Hooks.Permissions memory
+        )
     {
         return Hooks.Permissions({
-            beforeInitialize: false,
+            beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -385,20 +544,28 @@ contract SchrodingerHook is
     }
 
     /*//////////////////////////////////////////////////////////////
-                    DIRECT UNISWAP V4 HOOK CALLBACKS
+                    UNISWAP V4 CALLBACKS
     //////////////////////////////////////////////////////////////*/
 
-    modifier onlyPoolManager() {
-        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
-        _;
-    }
-
     function beforeInitialize(
-        address,
-        PoolKey calldata,
+        address sender,
+        PoolKey calldata key,
         uint160
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.beforeInitialize.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        _beforeInitializePermissionCheck(
+            sender,
+            key
+        );
+
+        return
+            IHooks
+                .beforeInitialize
+                .selector;
     }
 
     function afterInitialize(
@@ -406,17 +573,38 @@ contract SchrodingerHook is
         PoolKey calldata,
         uint160,
         int24
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.afterInitialize.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        return
+            IHooks
+                .afterInitialize
+                .selector;
     }
 
     function beforeAddLiquidity(
-        address,
-        PoolKey calldata,
+        address sender,
+        PoolKey calldata key,
         ModifyLiquidityParams calldata,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.beforeAddLiquidity.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        _requirePermissionedLiquidityWrapper(
+            sender,
+            key
+        );
+
+        return
+            IHooks
+                .beforeAddLiquidity
+                .selector;
     }
 
     function afterAddLiquidity(
@@ -426,10 +614,21 @@ contract SchrodingerHook is
         BalanceDelta,
         BalanceDelta,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+    )
+        external
+        override
+        onlyPoolManager
+        returns (
+            bytes4,
+            BalanceDelta
+        )
+    {
         return (
-            IHooks.afterAddLiquidity.selector,
-            BalanceDeltaLibrary.ZERO_DELTA
+            IHooks
+                .afterAddLiquidity
+                .selector,
+            BalanceDeltaLibrary
+                .ZERO_DELTA
         );
     }
 
@@ -438,8 +637,16 @@ contract SchrodingerHook is
         PoolKey calldata,
         ModifyLiquidityParams calldata,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.beforeRemoveLiquidity.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        return
+            IHooks
+                .beforeRemoveLiquidity
+                .selector;
     }
 
     function afterRemoveLiquidity(
@@ -449,10 +656,21 @@ contract SchrodingerHook is
         BalanceDelta,
         BalanceDelta,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+    )
+        external
+        override
+        onlyPoolManager
+        returns (
+            bytes4,
+            BalanceDelta
+        )
+    {
         return (
-            IHooks.afterRemoveLiquidity.selector,
-            BalanceDeltaLibrary.ZERO_DELTA
+            IHooks
+                .afterRemoveLiquidity
+                .selector,
+            BalanceDeltaLibrary
+                .ZERO_DELTA
         );
     }
 
@@ -465,9 +683,18 @@ contract SchrodingerHook is
         external
         override
         onlyPoolManager
-        returns (bytes4, BeforeSwapDelta, uint24)
+        returns (
+            bytes4,
+            BeforeSwapDelta,
+            uint24
+        )
     {
-        return _beforeSwap(sender, key, params, hookData);
+        return _beforeSwap(
+            sender,
+            key,
+            params,
+            hookData
+        );
     }
 
     function afterSwap(
@@ -476,8 +703,22 @@ contract SchrodingerHook is
         SwapParams calldata params,
         BalanceDelta delta,
         bytes calldata hookData
-    ) external override onlyPoolManager returns (bytes4, int128) {
-        return _afterSwap(sender, key, params, delta, hookData);
+    )
+        external
+        override
+        onlyPoolManager
+        returns (
+            bytes4,
+            int128
+        )
+    {
+        return _afterSwap(
+            sender,
+            key,
+            params,
+            delta,
+            hookData
+        );
     }
 
     function beforeDonate(
@@ -486,8 +727,16 @@ contract SchrodingerHook is
         uint256,
         uint256,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.beforeDonate.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        return
+            IHooks
+                .beforeDonate
+                .selector;
     }
 
     function afterDonate(
@@ -496,76 +745,248 @@ contract SchrodingerHook is
         uint256,
         uint256,
         bytes calldata
-    ) external override onlyPoolManager returns (bytes4) {
-        return IHooks.afterDonate.selector;
+    )
+        external
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        return
+            IHooks
+                .afterDonate
+                .selector;
     }
 
     /*//////////////////////////////////////////////////////////////
                                ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    function setProtocolModule(address module, bool approved) external onlyOwner {
-        if (module == address(0)) revert InvalidAddress();
-        approvedProtocolModule[module] = approved;
-        emit ProtocolModuleSet(module, approved);
+    function setProtocolModule(
+        address module,
+        bool approved
+    )
+        external
+        onlyOwner
+    {
+        if (module == address(0)) {
+            revert InvalidAddress();
+        }
+
+        approvedProtocolModule[
+            module
+        ] = approved;
+
+        emit ProtocolModuleSet(
+            module,
+            approved
+        );
     }
 
-    function setApprovedEToken(address token, bool approved) external onlyOwner {
-        if (token == address(0)) revert InvalidAddress();
-        if (approved) _requireHybridEToken(token);
-        approvedEToken[token] = approved;
-        emit ETokenApprovalSet(token, approved);
+    function setPermissionsAdapterFactory(
+        address factory
+    )
+        external
+        onlyOwner
+    {
+        if (factory == address(0)) {
+            revert InvalidAddress();
+        }
+
+        permissionsAdapterFactory =
+            IPermissionsAdapterFactory(
+                factory
+            );
+
+        emit PermissionsAdapterFactorySet(
+            factory
+        );
     }
 
-    function setApprovedEAssetToken(address token, bool approved) external onlyOwner {
-        if (token == address(0)) revert InvalidAddress();
-        if (approved) _requireEncrypted1155(token);
-        approvedEAssetToken[token] = approved;
-        emit EAssetTokenApprovalSet(token, approved);
+    function setApprovedEToken(
+        address token,
+        bool approved
+    )
+        external
+        onlyOwner
+    {
+        if (token == address(0)) {
+            revert InvalidAddress();
+        }
+
+        if (approved) {
+            _requireHybridEToken(
+                token
+            );
+        }
+
+        approvedEToken[token] =
+            approved;
+
+        emit ETokenApprovalSet(
+            token,
+            approved
+        );
     }
 
-    function setApprovedBondContract(address bond, bool approved) external onlyOwner {
-        if (bond == address(0)) revert InvalidAddress();
-        if (approved) _requireERC3475(bond);
-        approvedBondContract[bond] = approved;
-        emit BondApprovalSet(bond, approved);
+    function setApprovedEAssetToken(
+        address token,
+        bool approved
+    )
+        external
+        onlyOwner
+    {
+        if (token == address(0)) {
+            revert InvalidAddress();
+        }
+
+        if (approved) {
+            _requireEncrypted1155(
+                token
+            );
+        }
+
+        approvedEAssetToken[token] =
+            approved;
+
+        emit EAssetTokenApprovalSet(
+            token,
+            approved
+        );
     }
 
-    function setGlobalPaused(bool paused) external onlyOwner {
-        globalPaused = paused;
+    function setApprovedBondContract(
+        address bond,
+        bool approved
+    )
+        external
+        onlyOwner
+    {
+        if (bond == address(0)) {
+            revert InvalidAddress();
+        }
+
+        if (approved) {
+            _requireERC3475(
+                bond
+            );
+        }
+
+        approvedBondContract[bond] =
+            approved;
+
+        emit BondApprovalSet(
+            bond,
+            approved
+        );
     }
 
-    /// @notice Funds the hook's Uniswap v4 rebalancing inventory.
-    function depositEToken(address token, uint256 amount) external nonReentrant {
-        if (!approvedEToken[token]) revert UnapprovedToken();
-        _requireHybridEToken(token);
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+    function setGlobalPaused(
+        bool paused
+    )
+        external
+        onlyOwner
+    {
+        globalPaused =
+            paused;
     }
 
-    function withdrawEToken(address token, address recipient, uint256 amount)
+    /*//////////////////////////////////////////////////////////////
+                       INVENTORY / CUSTODY
+    //////////////////////////////////////////////////////////////*/
+
+    function depositEToken(
+        address token,
+        uint256 amount
+    )
+        external
+        nonReentrant
+    {
+        if (!approvedEToken[token]) {
+            revert UnapprovedToken();
+        }
+
+        _requireHybridEToken(
+            token
+        );
+
+        IERC20(token)
+            .safeTransferFrom(
+                msg.sender,
+                address(this),
+                amount
+            );
+    }
+
+    function withdrawEToken(
+        address token,
+        address recipient,
+        uint256 amount
+    )
         external
         onlyOwner
         nonReentrant
     {
-        if (recipient == address(0)) revert InvalidAddress();
-        IERC20(token).safeTransfer(recipient, amount);
+        if (recipient == address(0)) {
+            revert InvalidAddress();
+        }
+
+        IERC20(token)
+            .safeTransfer(
+                recipient,
+                amount
+            );
     }
 
-    /// @notice Custodies an approved encrypted eAsset position for its private market.
     function depositEAsset(
         address positionToken,
         uint256 tokenId,
         uint256 amount,
         bytes calldata data
-    ) external nonReentrant {
-        if (!approvedEAssetToken[positionToken]) revert UnapprovedToken();
-        IERC1155(positionToken).safeTransferFrom(
-            msg.sender,
-            address(this),
-            tokenId,
-            amount,
-            data
-        );
+    )
+        external
+        nonReentrant
+    {
+        if (
+            !approvedEAssetToken[
+                positionToken
+            ]
+        ) {
+            revert UnapprovedToken();
+        }
+
+        bytes32 positionRef =
+            keccak256(
+                abi.encode(
+                    positionToken,
+                    tokenId
+                )
+            );
+
+        bytes32 marketId =
+            eAssetMarketByPosition[
+                positionRef
+            ];
+
+        if (
+            marketId
+                != bytes32(0)
+        ) {
+            _requireEAssetPermission(
+                marketId,
+                msg.sender,
+                PermissionFlags
+                    .LIQUIDITY_ALLOWED
+            );
+        }
+
+        IERC1155(positionToken)
+            .safeTransferFrom(
+                msg.sender,
+                address(this),
+                tokenId,
+                amount,
+                data
+            );
     }
 
     function withdrawEAsset(
@@ -574,62 +995,182 @@ contract SchrodingerHook is
         uint256 tokenId,
         uint256 amount,
         bytes calldata data
-    ) external onlyOwner nonReentrant {
-        if (recipient == address(0)) revert InvalidAddress();
-        IERC1155(positionToken).safeTransferFrom(
-            address(this),
-            recipient,
-            tokenId,
-            amount,
-            data
-        );
+    )
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (recipient == address(0)) {
+            revert InvalidAddress();
+        }
+
+        IERC1155(positionToken)
+            .safeTransferFrom(
+                address(this),
+                recipient,
+                tokenId,
+                amount,
+                data
+            );
     }
 
     /*//////////////////////////////////////////////////////////////
-                         CONFIDENTIAL PLANS
+                        CONFIDENTIAL PLANS
     //////////////////////////////////////////////////////////////*/
 
-    function createPlan(PlanInput calldata input) external returns (bytes32 planId) {
-        uint256 len = input.encryptedTargets.length;
-        if (input.marketType == MarketType.UNSET) revert WrongMarketType();
-        if (len == 0 || len > MAX_ASSETS) revert InvalidAssetCount();
+    function createPlan(
+        PlanInput calldata input
+    )
+        external
+        returns (bytes32 planId)
+    {
+        uint256 len =
+            input
+                .encryptedTargets
+                .length;
 
-        planId = keccak256(
-            abi.encode(msg.sender, block.chainid, address(this), ++_planNonce)
-        );
+        if (
+            input.marketType
+                == MarketType.UNSET
+        ) {
+            revert WrongMarketType();
+        }
 
-        ExecutionPlan storage plan = _plans[planId];
-        plan.owner = msg.sender;
-        plan.marketType = input.marketType;
-        plan.strategyKind = input.strategyKind;
-        plan.executionMode = input.executionMode;
-        plan.capabilities = input.capabilities;
+        if (
+            len == 0
+                || len > MAX_ASSETS
+        ) {
+            revert InvalidAssetCount();
+        }
+
+        planId =
+            keccak256(
+                abi.encode(
+                    msg.sender,
+                    block.chainid,
+                    address(this),
+                    ++_planNonce
+                )
+            );
+
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        plan.owner =
+            msg.sender;
+
+        plan.marketType =
+            input.marketType;
+
+        plan.strategyKind =
+            input.strategyKind;
+
+        plan.executionMode =
+            input.executionMode;
+
+        plan.capabilities =
+            input.capabilities;
+
         plan.active = true;
         plan.armed = false;
-        plan.assetCount = uint8(len);
+        plan.assetCount =
+            uint8(len);
 
-        plan.rebalanceThresholdBps = FHE.asEuint64(input.encryptedRebalanceThresholdBps);
-        plan.maximumAllocation = FHE.asEuint64(input.encryptedMaximumAllocation);
-        plan.hedgeIntensityBps = FHE.asEuint64(input.encryptedHedgeIntensityBps);
-        plan.volatilityBps = FHE.asEuint64(input.encryptedVolatilityBps);
-        plan.feeAprBps = FHE.asEuint64(input.encryptedFeeAprBps);
-        plan.timingSeed = FHE.asEuint64(input.encryptedTimingSeed);
-        plan.complianceEnabled = FHE.asEbool(input.encryptedComplianceEnabled);
+        plan.rebalanceThresholdBps =
+            FHE.asEuint64(
+                input
+                    .encryptedRebalanceThresholdBps
+            );
 
-        _allowOwnerAndContract(plan.rebalanceThresholdBps);
-        _allowOwnerAndContract(plan.maximumAllocation);
-        _allowOwnerAndContract(plan.hedgeIntensityBps);
-        _allowOwnerAndContract(plan.volatilityBps);
-        _allowOwnerAndContract(plan.feeAprBps);
-        _allowOwnerAndContract(plan.timingSeed);
-        FHE.allowThis(plan.complianceEnabled);
-        FHE.allowSender(plan.complianceEnabled);
+        plan.maximumAllocation =
+            FHE.asEuint64(
+                input
+                    .encryptedMaximumAllocation
+            );
 
-        for (uint8 i; i < len; ++i) {
-            plan.targetBps[i] = FHE.asEuint64(input.encryptedTargets[i]);
-            plan.exposure[i] = FHE.asEuint64(0);
-            _allowOwnerAndContract(plan.targetBps[i]);
-            _allowOwnerAndContract(plan.exposure[i]);
+        plan.hedgeIntensityBps =
+            FHE.asEuint64(
+                input
+                    .encryptedHedgeIntensityBps
+            );
+
+        plan.volatilityBps =
+            FHE.asEuint64(
+                input
+                    .encryptedVolatilityBps
+            );
+
+        plan.feeAprBps =
+            FHE.asEuint64(
+                input
+                    .encryptedFeeAprBps
+            );
+
+        plan.timingSeed =
+            FHE.asEuint64(
+                input
+                    .encryptedTimingSeed
+            );
+
+        plan.complianceEnabled =
+            FHE.asEbool(
+                input
+                    .encryptedComplianceEnabled
+            );
+
+        _allowOwnerAndContract(
+            plan.rebalanceThresholdBps
+        );
+
+        _allowOwnerAndContract(
+            plan.maximumAllocation
+        );
+
+        _allowOwnerAndContract(
+            plan.hedgeIntensityBps
+        );
+
+        _allowOwnerAndContract(
+            plan.volatilityBps
+        );
+
+        _allowOwnerAndContract(
+            plan.feeAprBps
+        );
+
+        _allowOwnerAndContract(
+            plan.timingSeed
+        );
+
+        FHE.allowThis(
+            plan.complianceEnabled
+        );
+
+        FHE.allowSender(
+            plan.complianceEnabled
+        );
+
+        for (
+            uint8 i;
+            i < len;
+            ++i
+        ) {
+            plan.targetBps[i] =
+                FHE.asEuint64(
+                    input
+                        .encryptedTargets[i]
+                );
+
+            plan.exposure[i] =
+                FHE.asEuint64(0);
+
+            _allowOwnerAndContract(
+                plan.targetBps[i]
+            );
+
+            _allowOwnerAndContract(
+                plan.exposure[i]
+            );
         }
 
         emit PlanCreated(
@@ -642,24 +1183,48 @@ contract SchrodingerHook is
         );
     }
 
-    function setPlanArmed(bytes32 planId, bool armed)
+    function setPlanArmed(
+        bytes32 planId,
+        bool armed
+    )
         external
         onlyPlanOwner(planId)
     {
-        ExecutionPlan storage plan = _plans[planId];
-        if (!plan.active) revert PlanInactive();
-        plan.armed = armed;
-        emit PlanArmed(planId, armed);
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (!plan.active) {
+            revert PlanInactive();
+        }
+
+        plan.armed =
+            armed;
+
+        emit PlanArmed(
+            planId,
+            armed
+        );
     }
 
-    function deactivatePlan(bytes32 planId) external onlyPlanOwner(planId) {
-        _plans[planId].active = false;
-        _plans[planId].armed = false;
-        emit PlanDeactivated(planId);
+    function deactivatePlan(
+        bytes32 planId
+    )
+        external
+        onlyPlanOwner(planId)
+    {
+        _plans[planId]
+            .active = false;
+
+        _plans[planId]
+            .armed = false;
+
+        emit PlanDeactivated(
+            planId
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
-                      ETOKEN / UNISWAP V4 MARKETS
+                       ETOKEN MARKETS
     //////////////////////////////////////////////////////////////*/
 
     function createETokenMarket(
@@ -670,40 +1235,220 @@ contract SchrodingerHook is
         int24 defaultTickLower,
         int24 defaultTickUpper,
         bytes32 positionSalt
-    ) external onlyPlanOwner(planId) returns (PoolId poolId) {
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.marketType != MarketType.ETOKEN) revert WrongMarketType();
-        if (assetIndex >= plan.assetCount) revert InvalidAssetIndex();
-        if (address(key.hooks) != address(this)) revert InvalidMarket();
-        if (defaultTickLower >= defaultTickUpper) revert InvalidTicks();
+    )
+        external
+        onlyPlanOwner(planId)
+        returns (PoolId poolId)
+    {
+        return _createETokenMarket(
+            planId,
+            key,
+            sqrtPriceX96,
+            assetIndex,
+            defaultTickLower,
+            defaultTickUpper,
+            positionSalt,
+            AccessMode.PERMISSIONLESS
+        );
+    }
 
-        address token0 = _currencyToToken(key.currency0);
-        address token1 = _currencyToToken(key.currency1);
-        if (!approvedEToken[token0] || !approvedEToken[token1]) revert UnapprovedToken();
-        _requireHybridEToken(token0);
-        _requireHybridEToken(token1);
+    function createPermissionedETokenMarket(
+        bytes32 planId,
+        PoolKey calldata key,
+        uint160 sqrtPriceX96,
+        uint8 assetIndex,
+        int24 defaultTickLower,
+        int24 defaultTickUpper,
+        bytes32 positionSalt
+    )
+        external
+        onlyPlanOwner(planId)
+        returns (PoolId poolId)
+    {
+        return _createETokenMarket(
+            planId,
+            key,
+            sqrtPriceX96,
+            assetIndex,
+            defaultTickLower,
+            defaultTickUpper,
+            positionSalt,
+            AccessMode.PERMISSIONED
+        );
+    }
 
-        // Explicitly reject either side if it advertises the ERC1155 interface.
-        if (_supportsInterface(token0, type(IERC1155).interfaceId)
-            || _supportsInterface(token1, type(IERC1155).interfaceId)) {
-            revert MixedAssetStandards();
+    function _createETokenMarket(
+        bytes32 planId,
+        PoolKey calldata key,
+        uint160 sqrtPriceX96,
+        uint8 assetIndex,
+        int24 defaultTickLower,
+        int24 defaultTickUpper,
+        bytes32 positionSalt,
+        AccessMode accessMode
+    )
+        internal
+        returns (PoolId poolId)
+    {
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (
+            plan.marketType
+                != MarketType.ETOKEN
+        ) {
+            revert WrongMarketType();
         }
 
-        poolId = key.toId();
-        ETokenMarket storage market = eTokenMarkets[poolId];
-        if (market.initialized) revert InvalidMarket();
+        if (
+            assetIndex
+                >= plan.assetCount
+        ) {
+            revert InvalidAssetIndex();
+        }
+
+        if (
+            address(key.hooks)
+                != address(this)
+        ) {
+            revert InvalidMarket();
+        }
+
+        if (
+            defaultTickLower
+                >= defaultTickUpper
+        ) {
+            revert InvalidTicks();
+        }
+
+        address currency0 =
+            _currencyToToken(
+                key.currency0
+            );
+
+        address currency1 =
+            _currencyToToken(
+                key.currency1
+            );
+
+        (
+            address token0,
+            bool adapter0
+        ) = _resolveETokenCurrency(
+            currency0
+        );
+
+        (
+            address token1,
+            bool adapter1
+        ) = _resolveETokenCurrency(
+            currency1
+        );
+
+        if (
+            accessMode
+                == AccessMode.PERMISSIONED
+        ) {
+            if (
+                address(
+                    permissionsAdapterFactory
+                )
+                    == address(0)
+            ) {
+                revert
+                    PermissionedFactoryNotConfigured();
+            }
+
+            if (
+                !adapter0
+                    && !adapter1
+            ) {
+                revert
+                    PermissionedAdapterRequired();
+            }
+        } else {
+            if (
+                adapter0
+                    || adapter1
+            ) {
+                revert
+                    PermissionedAdapterRequired();
+            }
+        }
+
+        if (
+            !approvedEToken[token0]
+                || !approvedEToken[token1]
+        ) {
+            revert UnapprovedToken();
+        }
+
+        _requireHybridEToken(
+            token0
+        );
+
+        _requireHybridEToken(
+            token1
+        );
+
+        if (
+            _supportsInterface(
+                token0,
+                type(IERC1155)
+                    .interfaceId
+            )
+                || _supportsInterface(
+                    token1,
+                    type(IERC1155)
+                        .interfaceId
+                )
+        ) {
+            revert
+                MixedAssetStandards();
+        }
+
+        poolId =
+            key.toId();
+
+        ETokenMarket storage market =
+            eTokenMarkets[poolId];
+
+        if (market.initialized) {
+            revert InvalidMarket();
+        }
 
         market.initialized = true;
         market.planId = planId;
         market.assetIndex = assetIndex;
+        market.accessMode = accessMode;
         market.token0 = token0;
         market.token1 = token1;
-        market.defaultTickLower = defaultTickLower;
-        market.defaultTickUpper = defaultTickUpper;
-        market.positionSalt = positionSalt;
+        market.defaultTickLower =
+            defaultTickLower;
+        market.defaultTickUpper =
+            defaultTickUpper;
+        market.positionSalt =
+            positionSalt;
 
-        poolManager.initialize(key, sqrtPriceX96);
-        emit ETokenMarketCreated(poolId, planId, token0, token1, assetIndex);
+        poolManager.initialize(
+            key,
+            sqrtPriceX96
+        );
+
+        emit ETokenMarketCreated(
+            poolId,
+            planId,
+            token0,
+            token1,
+            assetIndex
+        );
+
+        emit ETokenAccessModeSet(
+            poolId,
+            accessMode,
+            token0,
+            token1
+        );
     }
 
     function executeETokenRebalance(
@@ -713,61 +1458,183 @@ contract SchrodingerHook is
         int24 tickUpper,
         int256 liquidityDelta,
         bytes32 positionSalt
-    ) external onlyProtocolModule nonReentrant returns (bytes memory result) {
-        if (executionId == bytes32(0)) revert InvalidExecutionId();
-        if (processedExecutions[executionId]) revert ExecutionAlreadyProcessed();
-        if (liquidityDelta == 0) revert InvalidLiquidityDelta();
-        if (tickLower >= tickUpper) revert InvalidTicks();
+    )
+        external
+        onlyProtocolModule
+        nonReentrant
+        returns (bytes memory result)
+    {
+        if (
+            executionId
+                == bytes32(0)
+        ) {
+            revert InvalidExecutionId();
+        }
 
-        PoolId poolId = key.toId();
-        ETokenMarket storage market = eTokenMarkets[poolId];
-        if (!market.initialized) revert InvalidMarket();
-        _requireOperational(market.paused, bytes32(PoolId.unwrap(poolId)));
+        if (
+            processedExecutions[
+                executionId
+            ]
+        ) {
+            revert
+                ExecutionAlreadyProcessed();
+        }
 
-        ExecutionPlan storage plan = _plans[market.planId];
-        _requireExecutable(plan, CAP_TEMPORARY_LIQUIDITY | CAP_PERSISTENT_LIQUIDITY, true);
+        if (
+            liquidityDelta == 0
+        ) {
+            revert
+                InvalidLiquidityDelta();
+        }
 
-        processedExecutions[executionId] = true;
+        if (
+            tickLower >= tickUpper
+        ) {
+            revert InvalidTicks();
+        }
 
-        LiquidityExecution memory request = LiquidityExecution({
-            action: UnlockAction.MODIFY_LIQUIDITY,
-            planId: market.planId,
-            executionId: executionId,
-            key: key,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            liquidityDelta: liquidityDelta,
-            positionSalt: positionSalt
-        });
+        PoolId poolId =
+            key.toId();
 
-        result = poolManager.unlock(abi.encode(request));
+        ETokenMarket storage market =
+            eTokenMarkets[poolId];
+
+        if (!market.initialized) {
+            revert InvalidMarket();
+        }
+
+        _requireOperational(
+            market.paused,
+            bytes32(
+                PoolId.unwrap(
+                    poolId
+                )
+            )
+        );
+
+        ExecutionPlan storage plan =
+            _plans[
+                market.planId
+            ];
+
+        _requireExecutable(
+            plan,
+            CAP_TEMPORARY_LIQUIDITY
+                | CAP_PERSISTENT_LIQUIDITY,
+            true
+        );
+
+        processedExecutions[
+            executionId
+        ] = true;
+
+        LiquidityExecution memory request =
+            LiquidityExecution({
+                action:
+                    UnlockAction
+                        .MODIFY_LIQUIDITY,
+                planId:
+                    market.planId,
+                executionId:
+                    executionId,
+                key:
+                    key,
+                tickLower:
+                    tickLower,
+                tickUpper:
+                    tickUpper,
+                liquidityDelta:
+                    liquidityDelta,
+                positionSalt:
+                    positionSalt
+            });
+
+        result =
+            poolManager.unlock(
+                abi.encode(request)
+            );
     }
 
-    function unlockCallback(bytes calldata data)
+    function unlockCallback(
+        bytes calldata data
+    )
         external
         override
         returns (bytes memory result)
     {
-        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
-        LiquidityExecution memory request = abi.decode(data, (LiquidityExecution));
-        if (request.action != UnlockAction.MODIFY_LIQUIDITY) revert InvalidMarket();
+        if (
+            msg.sender
+                != address(poolManager)
+        ) {
+            revert OnlyPoolManager();
+        }
 
-        PoolId poolId = request.key.toId();
-        ETokenMarket storage market = eTokenMarkets[poolId];
-        if (!market.initialized || market.planId != request.planId) revert InvalidMarket();
+        LiquidityExecution memory request =
+            abi.decode(
+                data,
+                (LiquidityExecution)
+            );
 
-        ModifyLiquidityParams memory params = ModifyLiquidityParams({
-            tickLower: request.tickLower,
-            tickUpper: request.tickUpper,
-            liquidityDelta: request.liquidityDelta,
-            salt: request.positionSalt
-        });
+        if (
+            request.action
+                != UnlockAction
+                    .MODIFY_LIQUIDITY
+        ) {
+            revert InvalidMarket();
+        }
 
-        (BalanceDelta callerDelta, BalanceDelta feesAccrued) =
-            poolManager.modifyLiquidity(request.key, params, bytes("SCHRODINGER_REBALANCE"));
+        PoolId poolId =
+            request.key.toId();
 
-        _settleOrTake(request.key.currency0, callerDelta.amount0());
-        _settleOrTake(request.key.currency1, callerDelta.amount1());
+        ETokenMarket storage market =
+            eTokenMarkets[poolId];
+
+        if (
+            !market.initialized
+                || market.planId
+                    != request.planId
+        ) {
+            revert InvalidMarket();
+        }
+
+        ModifyLiquidityParams memory params =
+            ModifyLiquidityParams({
+                tickLower:
+                    request.tickLower,
+                tickUpper:
+                    request.tickUpper,
+                liquidityDelta:
+                    request.liquidityDelta,
+                salt:
+                    request.positionSalt
+            });
+
+        (
+            BalanceDelta callerDelta,
+            BalanceDelta feesAccrued
+        ) =
+            poolManager
+                .modifyLiquidity(
+                    request.key,
+                    params,
+                    bytes(
+                        "SCHRODINGER_REBALANCE"
+                    )
+                );
+
+        _settleOrTake(
+            request
+                .key
+                .currency0,
+            callerDelta.amount0()
+        );
+
+        _settleOrTake(
+            request
+                .key
+                .currency1,
+            callerDelta.amount1()
+        );
 
         emit ETokenRebalanceExecuted(
             poolId,
@@ -778,66 +1645,215 @@ contract SchrodingerHook is
             callerDelta.amount1()
         );
 
-        return abi.encode(callerDelta, feesAccrued);
+        return abi.encode(
+            callerDelta,
+            feesAccrued
+        );
     }
 
     function _beforeSwap(
-        address,
+        address sender,
         PoolKey calldata key,
         SwapParams calldata,
         bytes calldata
-    ) internal returns (bytes4, BeforeSwapDelta, uint24) {
-        PoolId poolId = key.toId();
-        ETokenMarket storage market = eTokenMarkets[poolId];
-        if (!market.initialized) {
-            return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-        }
-        _requireOperational(market.paused, bytes32(PoolId.unwrap(poolId)));
+    )
+        internal
+        returns (
+            bytes4,
+            BeforeSwapDelta,
+            uint24
+        )
+    {
+        PoolId poolId =
+            key.toId();
 
-        ExecutionPlan storage plan = _plans[market.planId];
-        if (!plan.active || !plan.armed) {
-            return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        ETokenMarket storage market =
+            eTokenMarkets[poolId];
+
+        if (!market.initialized) {
+            return (
+                IHooks
+                    .beforeSwap
+                    .selector,
+                BeforeSwapDeltaLibrary
+                    .ZERO_DELTA,
+                0
+            );
         }
-        _requireCapability(plan, CAP_BEFORE_SWAP);
-        _evaluatePrivateRebalance(plan, market.assetIndex);
+
+        _requireOperational(
+            market.paused,
+            bytes32(
+                PoolId.unwrap(
+                    poolId
+                )
+            )
+        );
+
+        _requirePermissionedSwapWrapper(
+            sender,
+            key
+        );
+
+        ExecutionPlan storage plan =
+            _plans[
+                market.planId
+            ];
+
+        if (
+            !plan.active
+                || !plan.armed
+        ) {
+            return (
+                IHooks
+                    .beforeSwap
+                    .selector,
+                BeforeSwapDeltaLibrary
+                    .ZERO_DELTA,
+                0
+            );
+        }
+
+        _requireCapability(
+            plan,
+            CAP_BEFORE_SWAP
+        );
+
+        _evaluatePrivateRebalance(
+            plan,
+            market.assetIndex
+        );
 
         emit PrivateRebalanceEvaluated(
             market.planId,
-            bytes32(PoolId.unwrap(poolId)),
+            bytes32(
+                PoolId.unwrap(
+                    poolId
+                )
+            ),
             MarketType.ETOKEN
         );
-        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+
+        return (
+            IHooks
+                .beforeSwap
+                .selector,
+            BeforeSwapDeltaLibrary
+                .ZERO_DELTA,
+            0
+        );
     }
 
     function _afterSwap(
-        address,
+        address sender,
         PoolKey calldata key,
         SwapParams calldata,
         BalanceDelta delta,
         bytes calldata
-    ) internal returns (bytes4, int128) {
-        PoolId poolId = key.toId();
-        ETokenMarket storage market = eTokenMarkets[poolId];
-        if (!market.initialized) return (IHooks.afterSwap.selector, 0);
+    )
+        internal
+        returns (
+            bytes4,
+            int128
+        )
+    {
+        PoolId poolId =
+            key.toId();
 
-        ExecutionPlan storage plan = _plans[market.planId];
-        if (!plan.active) return (IHooks.afterSwap.selector, 0);
-        _requireCapability(plan, CAP_AFTER_SWAP);
+        ETokenMarket storage market =
+            eTokenMarkets[poolId];
 
-        uint8 asset = market.assetIndex;
-        euint64 encryptedDelta = _publicDeltaToEncryptedAbs(delta.amount0());
-        plan.exposure[asset] = FHE.add(plan.exposure[asset], encryptedDelta);
-        plan.drift[asset] = _encryptedAbsDiff(plan.exposure[asset], plan.targetBps[asset]);
-        plan.lastRebalanceDelta[asset] = _sizedEncryptedRebalanceDelta(plan, plan.drift[asset]);
-        _allowOwnerAndContract(plan.exposure[asset]);
-        _allowOwnerAndContract(plan.drift[asset]);
-        _allowOwnerAndContract(plan.lastRebalanceDelta[asset]);
+        if (!market.initialized) {
+            return (
+                IHooks
+                    .afterSwap
+                    .selector,
+                0
+            );
+        }
 
-        return (IHooks.afterSwap.selector, 0);
+        ExecutionPlan storage plan =
+            _plans[
+                market.planId
+            ];
+
+        if (!plan.active) {
+            return (
+                IHooks
+                    .afterSwap
+                    .selector,
+                0
+            );
+        }
+
+        _requireCapability(
+            plan,
+            CAP_AFTER_SWAP
+        );
+
+        uint8 asset =
+            market.assetIndex;
+
+        euint64 encryptedDelta =
+            _publicDeltaToEncryptedAbs(
+                delta.amount0()
+            );
+
+        plan.exposure[asset] =
+            FHE.add(
+                plan.exposure[asset],
+                encryptedDelta
+            );
+
+        plan.drift[asset] =
+            _encryptedAbsDiff(
+                plan.exposure[asset],
+                plan.targetBps[asset]
+            );
+
+        plan.lastRebalanceDelta[asset] =
+            _sizedEncryptedRebalanceDelta(
+                plan,
+                plan.drift[asset]
+            );
+
+        _allowOwnerAndContract(
+            plan.exposure[asset]
+        );
+
+        _allowOwnerAndContract(
+            plan.drift[asset]
+        );
+
+        _allowOwnerAndContract(
+            plan
+                .lastRebalanceDelta[
+                    asset
+                ]
+        );
+
+        if (
+            market.accessMode
+                == AccessMode.PERMISSIONED
+        ) {
+            emit PermissionedSwapObserved(
+                poolId,
+                sender,
+                market.token0,
+                market.token1
+            );
+        }
+
+        return (
+            IHooks
+                .afterSwap
+                .selector,
+            0
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
-                       EASSET / ERC1155 MARKETS
+                         EASSET MARKETS
     //////////////////////////////////////////////////////////////*/
 
     function createEAssetMarket(
@@ -849,54 +1865,220 @@ contract SchrodingerHook is
         uint256 bondClassId,
         uint256 bondNonceId,
         address settlementEToken
-    ) external onlyPlanOwner(planId) returns (bytes32 marketId) {
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.marketType != MarketType.EASSET) revert WrongMarketType();
-        if (assetIndex >= plan.assetCount) revert InvalidAssetIndex();
-        if (!approvedEAssetToken[positionToken]
-            || !approvedBondContract[backingBond]
-            || !approvedEToken[settlementEToken]) revert UnapprovedToken();
-
-        _requireEncrypted1155(positionToken);
-        _requireERC3475(backingBond);
-        _requireHybridEToken(settlementEToken);
-
-        // The traded position is ERC1155 and the settlement asset is eToken.
-        // Neither can be substituted for the other or placed in one PoolKey.
-        if (_supportsInterface(positionToken, ERC7984_INTERFACE_ID)
-            || _supportsInterface(settlementEToken, type(IERC1155).interfaceId)) {
-            revert MixedAssetStandards();
-        }
-
-        marketId = keccak256(
-            abi.encode(
-                MarketType.EASSET,
-                positionToken,
-                positionTokenId,
-                backingBond,
-                bondClassId,
-                bondNonceId,
-                address(this)
+    )
+        external
+        onlyPlanOwner(planId)
+        returns (bytes32 marketId)
+    {
+        return _createEAssetMarket(
+            planId,
+            assetIndex,
+            positionToken,
+            positionTokenId,
+            backingBond,
+            bondClassId,
+            bondNonceId,
+            settlementEToken,
+            AccessMode.PERMISSIONLESS,
+            IAllowlistChecker(
+                address(0)
             )
         );
-        EAssetMarket storage market = _eAssetMarkets[marketId];
-        if (market.initialized) revert InvalidMarket();
+    }
+
+    function createPermissionedEAssetMarket(
+        bytes32 planId,
+        uint8 assetIndex,
+        address positionToken,
+        uint256 positionTokenId,
+        address backingBond,
+        uint256 bondClassId,
+        uint256 bondNonceId,
+        address settlementEToken,
+        IAllowlistChecker allowlistChecker
+    )
+        external
+        onlyPlanOwner(planId)
+        returns (bytes32 marketId)
+    {
+        _requireAllowlistChecker(
+            address(
+                allowlistChecker
+            )
+        );
+
+        return _createEAssetMarket(
+            planId,
+            assetIndex,
+            positionToken,
+            positionTokenId,
+            backingBond,
+            bondClassId,
+            bondNonceId,
+            settlementEToken,
+            AccessMode.PERMISSIONED,
+            allowlistChecker
+        );
+    }
+
+    function _createEAssetMarket(
+        bytes32 planId,
+        uint8 assetIndex,
+        address positionToken,
+        uint256 positionTokenId,
+        address backingBond,
+        uint256 bondClassId,
+        uint256 bondNonceId,
+        address settlementEToken,
+        AccessMode accessMode,
+        IAllowlistChecker allowlistChecker
+    )
+        internal
+        returns (bytes32 marketId)
+    {
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (
+            plan.marketType
+                != MarketType.EASSET
+        ) {
+            revert WrongMarketType();
+        }
+
+        if (
+            assetIndex
+                >= plan.assetCount
+        ) {
+            revert InvalidAssetIndex();
+        }
+
+        if (
+            !approvedEAssetToken[
+                positionToken
+            ]
+                || !approvedBondContract[
+                    backingBond
+                ]
+                || !approvedEToken[
+                    settlementEToken
+                ]
+        ) {
+            revert UnapprovedToken();
+        }
+
+        _requireEncrypted1155(
+            positionToken
+        );
+
+        _requireERC3475(
+            backingBond
+        );
+
+        _requireHybridEToken(
+            settlementEToken
+        );
+
+        if (
+            _supportsInterface(
+                positionToken,
+                ERC7984_INTERFACE_ID
+            )
+                || _supportsInterface(
+                    settlementEToken,
+                    type(IERC1155)
+                        .interfaceId
+                )
+        ) {
+            revert
+                MixedAssetStandards();
+        }
+
+        marketId =
+            keccak256(
+                abi.encode(
+                    MarketType.EASSET,
+                    positionToken,
+                    positionTokenId,
+                    backingBond,
+                    bondClassId,
+                    bondNonceId,
+                    address(this)
+                )
+            );
+
+        EAssetMarket storage market =
+            _eAssetMarkets[
+                marketId
+            ];
+
+        if (market.initialized) {
+            revert InvalidMarket();
+        }
 
         market.initialized = true;
-        market.planId = planId;
-        market.assetIndex = assetIndex;
-        market.positionToken = positionToken;
-        market.positionTokenId = positionTokenId;
-        market.backingBond = backingBond;
-        market.bondClassId = bondClassId;
-        market.bondNonceId = bondNonceId;
-        market.settlementEToken = settlementEToken;
-        market.encryptedInventory = FHE.asEuint64(0);
-        market.encryptedCollateral = FHE.asEuint64(0);
-        market.encryptedLastDelta = FHE.asEuint64(0);
-        _allowOwnerAndContract(market.encryptedInventory);
-        _allowOwnerAndContract(market.encryptedCollateral);
-        _allowOwnerAndContract(market.encryptedLastDelta);
+        market.planId =
+            planId;
+        market.assetIndex =
+            assetIndex;
+        market.accessMode =
+            accessMode;
+        market.allowlistChecker =
+            allowlistChecker;
+        market.positionToken =
+            positionToken;
+        market.positionTokenId =
+            positionTokenId;
+        market.backingBond =
+            backingBond;
+        market.bondClassId =
+            bondClassId;
+        market.bondNonceId =
+            bondNonceId;
+        market.settlementEToken =
+            settlementEToken;
+
+        market.encryptedInventory =
+            FHE.asEuint64(0);
+
+        market.encryptedCollateral =
+            FHE.asEuint64(0);
+
+        market.encryptedLastDelta =
+            FHE.asEuint64(0);
+
+        _allowOwnerAndContract(
+            market.encryptedInventory
+        );
+
+        _allowOwnerAndContract(
+            market.encryptedCollateral
+        );
+
+        _allowOwnerAndContract(
+            market.encryptedLastDelta
+        );
+
+        bytes32 positionRef =
+            keccak256(
+                abi.encode(
+                    positionToken,
+                    positionTokenId
+                )
+            );
+
+        if (
+            eAssetMarketByPosition[
+                positionRef
+            ]
+                != bytes32(0)
+        ) {
+            revert InvalidMarket();
+        }
+
+        eAssetMarketByPosition[
+            positionRef
+        ] = marketId;
 
         emit EAssetMarketCreated(
             marketId,
@@ -906,6 +2088,14 @@ contract SchrodingerHook is
             backingBond,
             settlementEToken
         );
+
+        emit EAssetAccessModeSet(
+            marketId,
+            accessMode,
+            address(
+                allowlistChecker
+            )
+        );
     }
 
     function executeEAssetRebalance(
@@ -913,47 +2103,188 @@ contract SchrodingerHook is
         bytes32 executionId,
         InEuint64 calldata encryptedInventoryDelta,
         InEuint64 calldata encryptedCollateralDelta
-    ) external onlyProtocolModule nonReentrant {
-        if (executionId == bytes32(0)) revert InvalidExecutionId();
-        if (processedExecutions[executionId]) revert ExecutionAlreadyProcessed();
+    )
+        external
+        onlyProtocolModule
+        nonReentrant
+    {
+        if (
+            executionId
+                == bytes32(0)
+        ) {
+            revert InvalidExecutionId();
+        }
 
-        EAssetMarket storage market = _eAssetMarkets[marketId];
-        if (!market.initialized) revert InvalidMarket();
-        _requireOperational(market.paused, marketId);
-        ExecutionPlan storage plan = _plans[market.planId];
-        _requireExecutable(plan, CAP_EASSET_REBALANCE, false);
+        if (
+            processedExecutions[
+                executionId
+            ]
+        ) {
+            revert
+                ExecutionAlreadyProcessed();
+        }
 
-        euint64 inventoryDelta = FHE.asEuint64(encryptedInventoryDelta);
-        euint64 collateralDelta = FHE.asEuint64(encryptedCollateralDelta);
-        market.encryptedInventory = FHE.add(market.encryptedInventory, inventoryDelta);
-        market.encryptedCollateral = FHE.add(market.encryptedCollateral, collateralDelta);
-        market.encryptedLastDelta = inventoryDelta;
-        plan.exposure[market.assetIndex] = FHE.add(plan.exposure[market.assetIndex], inventoryDelta);
-        plan.drift[market.assetIndex] = _encryptedAbsDiff(
-            plan.exposure[market.assetIndex], plan.targetBps[market.assetIndex]
+        EAssetMarket storage market =
+            _eAssetMarkets[
+                marketId
+            ];
+
+        if (!market.initialized) {
+            revert InvalidMarket();
+        }
+
+        _requireOperational(
+            market.paused,
+            marketId
         );
-        plan.lastRebalanceDelta[market.assetIndex] =
-            _sizedEncryptedRebalanceDelta(plan, plan.drift[market.assetIndex]);
 
-        _allowOwnerAndContract(market.encryptedInventory);
-        _allowOwnerAndContract(market.encryptedCollateral);
-        _allowOwnerAndContract(market.encryptedLastDelta);
-        _allowOwnerAndContract(plan.exposure[market.assetIndex]);
-        _allowOwnerAndContract(plan.drift[market.assetIndex]);
-        _allowOwnerAndContract(plan.lastRebalanceDelta[market.assetIndex]);
-        FHE.allow(market.encryptedInventory, plan.owner);
-        FHE.allow(market.encryptedCollateral, plan.owner);
-        FHE.allow(market.encryptedLastDelta, plan.owner);
-        FHE.allow(plan.exposure[market.assetIndex], plan.owner);
-        FHE.allow(plan.drift[market.assetIndex], plan.owner);
-        FHE.allow(plan.lastRebalanceDelta[market.assetIndex], plan.owner);
+        ExecutionPlan storage plan =
+            _plans[
+                market.planId
+            ];
 
-        processedExecutions[executionId] = true;
-        emit EAssetRebalanceRecorded(marketId, market.planId, executionId);
+        _requireExecutable(
+            plan,
+            CAP_EASSET_REBALANCE,
+            false
+        );
+
+        euint64 inventoryDelta =
+            FHE.asEuint64(
+                encryptedInventoryDelta
+            );
+
+        euint64 collateralDelta =
+            FHE.asEuint64(
+                encryptedCollateralDelta
+            );
+
+        market.encryptedInventory =
+            FHE.add(
+                market.encryptedInventory,
+                inventoryDelta
+            );
+
+        market.encryptedCollateral =
+            FHE.add(
+                market.encryptedCollateral,
+                collateralDelta
+            );
+
+        market.encryptedLastDelta =
+            inventoryDelta;
+
+        plan.exposure[
+            market.assetIndex
+        ] =
+            FHE.add(
+                plan.exposure[
+                    market.assetIndex
+                ],
+                inventoryDelta
+            );
+
+        plan.drift[
+            market.assetIndex
+        ] =
+            _encryptedAbsDiff(
+                plan.exposure[
+                    market.assetIndex
+                ],
+                plan.targetBps[
+                    market.assetIndex
+                ]
+            );
+
+        plan.lastRebalanceDelta[
+            market.assetIndex
+        ] =
+            _sizedEncryptedRebalanceDelta(
+                plan,
+                plan.drift[
+                    market.assetIndex
+                ]
+            );
+
+        _allowOwnerAndContract(
+            market.encryptedInventory
+        );
+
+        _allowOwnerAndContract(
+            market.encryptedCollateral
+        );
+
+        _allowOwnerAndContract(
+            market.encryptedLastDelta
+        );
+
+        _allowOwnerAndContract(
+            plan.exposure[
+                market.assetIndex
+            ]
+        );
+
+        _allowOwnerAndContract(
+            plan.drift[
+                market.assetIndex
+            ]
+        );
+
+        _allowOwnerAndContract(
+            plan.lastRebalanceDelta[
+                market.assetIndex
+            ]
+        );
+
+        FHE.allow(
+            market.encryptedInventory,
+            plan.owner
+        );
+
+        FHE.allow(
+            market.encryptedCollateral,
+            plan.owner
+        );
+
+        FHE.allow(
+            market.encryptedLastDelta,
+            plan.owner
+        );
+
+        FHE.allow(
+            plan.exposure[
+                market.assetIndex
+            ],
+            plan.owner
+        );
+
+        FHE.allow(
+            plan.drift[
+                market.assetIndex
+            ],
+            plan.owner
+        );
+
+        FHE.allow(
+            plan.lastRebalanceDelta[
+                market.assetIndex
+            ],
+            plan.owner
+        );
+
+        processedExecutions[
+            executionId
+        ] = true;
+
+        emit EAssetRebalanceRecorded(
+            marketId,
+            market.planId,
+            executionId
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
-               TELLOR / REACTIVE / HYPERLANE ADAPTERS
+                          TELLOR V1
     //////////////////////////////////////////////////////////////*/
 
     function receiveTellorSignal(
@@ -962,83 +2293,59 @@ contract SchrodingerHook is
         bytes32 queryId,
         uint256 value,
         uint256 timestamp,
-        bytes calldata adapterProof
-    ) external onlyProtocolModule {
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.owner == address(0)) revert InvalidPlan();
-        _requireCapability(plan, CAP_ORACLE_REFRESH);
-        plan.lastSignalAt = uint64(block.timestamp);
-        emit OracleSignalReceived(marketRef, planId, queryId, value, timestamp);
-        emit AutomationHandled(
-            AutomationAction.PRICE_UPDATE,
+        bytes calldata
+    )
+        external
+        onlyProtocolModule
+    {
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (
+            plan.owner
+                == address(0)
+        ) {
+            revert InvalidPlan();
+        }
+
+        _requireCapability(
+            plan,
+            CAP_ORACLE_REFRESH
+        );
+
+        plan.lastSignalAt =
+            uint64(
+                block.timestamp
+            );
+
+        emit OracleSignalReceived(
             marketRef,
             planId,
-            keccak256(abi.encode(queryId, timestamp, msg.sender)),
-            keccak256(adapterProof)
+            queryId,
+            value,
+            timestamp
         );
     }
 
-    function handleSchrodingerAutomation(
-        uint8 actionValue,
+    function setOracleDegraded(
         bytes32 marketRef,
-        bytes32 planId,
-        bytes32 executionId,
-        bytes calldata data
-    ) external onlyProtocolModule {
-        if (actionValue > uint8(type(AutomationAction).max)) {
-            revert UnsupportedAutomationAction();
-        }
-        AutomationAction action = AutomationAction(actionValue);
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.owner == address(0)) revert InvalidPlan();
-        if (executionId == bytes32(0)) revert InvalidExecutionId();
-        if (processedExecutions[executionId]) revert ExecutionAlreadyProcessed();
-
-        if (action == AutomationAction.ARM_PLAN) {
-            if (!plan.active) revert PlanInactive();
-            plan.armed = true;
-            emit PlanArmed(planId, true);
-        } else if (action == AutomationAction.DISARM_PLAN) {
-            plan.armed = false;
-            emit PlanArmed(planId, false);
-        } else if (action == AutomationAction.PAUSE_MARKET) {
-            _setMarketPaused(plan.marketType, marketRef, true);
-        } else if (action == AutomationAction.UNPAUSE_MARKET) {
-            _setMarketPaused(plan.marketType, marketRef, false);
-        } else if (action == AutomationAction.ORACLE_DEGRADED) {
-            oracleDegraded[marketRef] = true;
-            plan.armed = false;
-        } else if (action == AutomationAction.ORACLE_RECOVERED) {
-            oracleDegraded[marketRef] = false;
-        } else if (action == AutomationAction.HEDGE_REQUEST) {
-            _requireCapability(plan, CAP_EXTERNAL_HEDGE);
-        } else if (action == AutomationAction.POSITION_SETTLEMENT) {
-            if (plan.marketType != MarketType.EASSET) revert WrongMarketType();
-            _requireCapability(plan, CAP_BOND_SETTLEMENT);
-        } else if (
-            action == AutomationAction.PRICE_UPDATE
-                || action == AutomationAction.COLLATERAL_UPDATE
-                || action == AutomationAction.HEDGE_COMPLETE
-                || action == AutomationAction.REFRESH_RISK
-                || action == AutomationAction.EXECUTE_ETOKEN_REBALANCE
-                || action == AutomationAction.EXECUTE_EASSET_REBALANCE
-        ) {
-            // Signal-only instruction. Concrete execution must use the typed
-            // execution function so that token standards cannot be mixed.
-            plan.lastSignalAt = uint64(block.timestamp);
-        } else {
-            revert UnsupportedAutomationAction();
-        }
-
-        processedExecutions[executionId] = true;
-        emit AutomationHandled(action, marketRef, planId, executionId, keccak256(data));
+        bool degraded
+    )
+        external
+        onlyProtocolModule
+    {
+        oracleDegraded[
+            marketRef
+        ] = degraded;
     }
 
     /*//////////////////////////////////////////////////////////////
-                          VIEW / DISCLOSURE
+                           CORE VIEWS
     //////////////////////////////////////////////////////////////*/
 
-    function getPlanMetadata(bytes32 planId)
+    function getPlanMetadata(
+        bytes32 planId
+    )
         external
         view
         returns (
@@ -1053,8 +2360,16 @@ contract SchrodingerHook is
             uint64 lastSignalAt
         )
     {
-        ExecutionPlan storage plan = _plans[planId];
-        if (plan.owner == address(0)) revert InvalidPlan();
+        ExecutionPlan storage plan =
+            _plans[planId];
+
+        if (
+            plan.owner
+                == address(0)
+        ) {
+            revert InvalidPlan();
+        }
+
         return (
             plan.owner,
             plan.marketType,
@@ -1068,7 +2383,9 @@ contract SchrodingerHook is
         );
     }
 
-    function getEAssetMarket(bytes32 marketId)
+    function getEAssetMarket(
+        bytes32 marketId
+    )
         external
         view
         returns (
@@ -1084,7 +2401,11 @@ contract SchrodingerHook is
             address settlementEToken
         )
     {
-        EAssetMarket storage market = _eAssetMarkets[marketId];
+        EAssetMarket storage market =
+            _eAssetMarkets[
+                marketId
+            ];
+
         return (
             market.initialized,
             market.paused,
@@ -1099,197 +2420,839 @@ contract SchrodingerHook is
         );
     }
 
-    function grantAuditorAccess(bytes32 planId, address auditor, uint8 asset)
-        external
-        onlyPlanOwner(planId)
+    /*//////////////////////////////////////////////////////////////
+                     PERMISSIONED POOL INTERNALS
+    //////////////////////////////////////////////////////////////*/
+
+    function _beforeInitializePermissionCheck(
+        address,
+        PoolKey calldata key
+    )
+        internal
+        view
     {
-        if (auditor == address(0)) revert InvalidAddress();
-        ExecutionPlan storage plan = _plans[planId];
-        if (asset >= plan.assetCount) revert InvalidAssetIndex();
-        FHE.allow(plan.targetBps[asset], auditor);
-        FHE.allow(plan.exposure[asset], auditor);
-        FHE.allow(plan.drift[asset], auditor);
-        FHE.allow(plan.lastRebalanceDelta[asset], auditor);
-        FHE.allow(plan.rebalanceThresholdBps, auditor);
-        FHE.allow(plan.maximumAllocation, auditor);
-        FHE.allow(plan.hedgeIntensityBps, auditor);
-        FHE.allow(plan.volatilityBps, auditor);
-        FHE.allow(plan.feeAprBps, auditor);
-        FHE.allow(plan.timingSeed, auditor);
-        FHE.allow(plan.complianceEnabled, auditor);
-        FHE.allow(plan.lastExecutionApproved, auditor);
-        emit AuditorAccessGranted(planId, auditor, asset);
+        PoolId poolId =
+            key.toId();
+
+        ETokenMarket storage market =
+            eTokenMarkets[
+                poolId
+            ];
+
+        if (
+            !market.initialized
+                || market.accessMode
+                    == AccessMode
+                        .PERMISSIONLESS
+        ) {
+            return;
+        }
+
+        if (
+            address(
+                permissionsAdapterFactory
+            )
+                == address(0)
+        ) {
+            revert
+                PermissionedFactoryNotConfigured();
+        }
+
+        address currency0 =
+            _currencyToToken(
+                key.currency0
+            );
+
+        address currency1 =
+            _currencyToToken(
+                key.currency1
+            );
+
+        (
+            ,
+            bool adapter0
+        ) =
+            _resolveETokenCurrency(
+                currency0
+            );
+
+        (
+            ,
+            bool adapter1
+        ) =
+            _resolveETokenCurrency(
+                currency1
+            );
+
+        if (
+            !adapter0
+                && !adapter1
+        ) {
+            revert
+                PermissionedAdapterRequired();
+        }
     }
 
-    function getEncryptedPlanHandles(bytes32 planId, uint8 asset)
-        external
+    function _requirePermissionedSwapWrapper(
+        address wrapper,
+        PoolKey calldata key
+    )
+        internal
         view
-        onlyPlanOwner(planId)
-        returns (
-            euint64 target,
-            euint64 exposure,
-            euint64 drift,
-            euint64 lastRebalanceDelta,
-            ebool lastExecutionApproved
-        )
     {
-        ExecutionPlan storage plan = _plans[planId];
-        if (asset >= plan.assetCount) revert InvalidAssetIndex();
-        return (
-            plan.targetBps[asset],
-            plan.exposure[asset],
-            plan.drift[asset],
-            plan.lastRebalanceDelta[asset],
-            plan.lastExecutionApproved
+        ETokenMarket storage market =
+            eTokenMarkets[
+                key.toId()
+            ];
+
+        if (
+            !market.initialized
+                || market.accessMode
+                    == AccessMode
+                        .PERMISSIONLESS
+        ) {
+            return;
+        }
+
+        _requireAdapterWrapperForAction(
+            _currencyToToken(
+                key.currency0
+            ),
+            wrapper,
+            true
+        );
+
+        _requireAdapterWrapperForAction(
+            _currencyToToken(
+                key.currency1
+            ),
+            wrapper,
+            true
         );
     }
 
+    function _requirePermissionedLiquidityWrapper(
+        address wrapper,
+        PoolKey calldata key
+    )
+        internal
+        view
+    {
+        ETokenMarket storage market =
+            eTokenMarkets[
+                key.toId()
+            ];
+
+        if (
+            !market.initialized
+                || market.accessMode
+                    == AccessMode
+                        .PERMISSIONLESS
+        ) {
+            return;
+        }
+
+        _requireAdapterWrapperForAction(
+            _currencyToToken(
+                key.currency0
+            ),
+            wrapper,
+            false
+        );
+
+        _requireAdapterWrapperForAction(
+            _currencyToToken(
+                key.currency1
+            ),
+            wrapper,
+            false
+        );
+    }
+
+    function _requireAdapterWrapperForAction(
+        address currency,
+        address wrapper,
+        bool requireSwappingEnabled
+    )
+        internal
+        view
+    {
+        if (
+            address(
+                permissionsAdapterFactory
+            )
+                == address(0)
+        ) {
+            revert
+                PermissionedFactoryNotConfigured();
+        }
+
+        address underlying =
+            permissionsAdapterFactory
+                .verifiedPermissionsAdapterOf(
+                    currency
+                );
+
+        if (
+            underlying
+                == address(0)
+        ) {
+            return;
+        }
+
+        IPermissionsAdapter adapter =
+            IPermissionsAdapter(
+                currency
+            );
+
+        if (
+            adapter.POOL_MANAGER()
+                != address(
+                    poolManager
+                )
+        ) {
+            revert
+                UnverifiedPermissionsAdapter(
+                    currency
+                );
+        }
+
+        if (
+            !adapter
+                .allowedWrappers(
+                    wrapper
+                )
+        ) {
+            revert
+                PermissionedWrapperNotAllowed(
+                    currency,
+                    wrapper
+                );
+        }
+
+        if (
+            requireSwappingEnabled
+                && !adapter
+                    .swappingEnabled()
+        ) {
+            revert
+                PermissionedSwappingDisabled(
+                    currency
+                );
+        }
+    }
+
+    function _resolveETokenCurrency(
+        address currency
+    )
+        internal
+        view
+        returns (
+            address underlying,
+            bool isVerifiedAdapter
+        )
+    {
+        if (
+            address(
+                permissionsAdapterFactory
+            )
+                != address(0)
+        ) {
+            underlying =
+                permissionsAdapterFactory
+                    .verifiedPermissionsAdapterOf(
+                        currency
+                    );
+
+            if (
+                underlying
+                    != address(0)
+            ) {
+                if (
+                    IPermissionsAdapter(
+                        currency
+                    )
+                        .POOL_MANAGER()
+                        != address(
+                            poolManager
+                        )
+                ) {
+                    revert
+                        UnverifiedPermissionsAdapter(
+                            currency
+                        );
+                }
+
+                return (
+                    underlying,
+                    true
+                );
+            }
+        }
+
+        return (
+            currency,
+            false
+        );
+    }
+
+    function _requireAllowlistChecker(
+        address checker
+    )
+        internal
+        view
+    {
+        if (
+            checker == address(0)
+                || !_supportsInterface(
+                    checker,
+                    type(
+                        IAllowlistChecker
+                    ).interfaceId
+                )
+        ) {
+            revert
+                InvalidAllowlistChecker(
+                    checker
+                );
+        }
+    }
+
+    function _requireEAssetPermission(
+        bytes32 marketId,
+        address account,
+        PermissionFlag permission
+    )
+        internal
+        view
+    {
+        EAssetMarket storage market =
+            _eAssetMarkets[
+                marketId
+            ];
+
+        if (!market.initialized) {
+            revert InvalidMarket();
+        }
+
+        if (
+            market.accessMode
+                == AccessMode
+                    .PERMISSIONLESS
+        ) {
+            return;
+        }
+
+        PermissionFlag granted =
+            market
+                .allowlistChecker
+                .checkAllowlist(
+                    account,
+                    market.positionToken
+                );
+
+        if (
+            (
+                PermissionFlag.unwrap(
+                    granted
+                )
+                    & PermissionFlag.unwrap(
+                        permission
+                    )
+            )
+                != PermissionFlag.unwrap(
+                    permission
+                )
+        ) {
+            revert PermissionDenied(
+                account,
+                market.positionToken,
+                PermissionFlag.unwrap(
+                    permission
+                )
+            );
+        }
+    }
+
     /*//////////////////////////////////////////////////////////////
-                              INTERNAL
+                       PRIVATE REBALANCING
     //////////////////////////////////////////////////////////////*/
 
-    function _evaluatePrivateRebalance(ExecutionPlan storage plan, uint8 asset) internal {
-        euint64 drift = _encryptedAbsDiff(plan.exposure[asset], plan.targetBps[asset]);
-        euint64 threshold = _volatilityAdjustedThreshold(plan);
-        euint64 proposedDelta = _sizedEncryptedRebalanceDelta(plan, drift);
-        ebool thresholdPassed = FHE.gt(drift, threshold);
-        ebool allocationAllowed = FHE.lte(proposedDelta, plan.maximumAllocation);
+    function _evaluatePrivateRebalance(
+        ExecutionPlan storage plan,
+        uint8 asset
+    )
+        internal
+    {
+        euint64 drift =
+            _encryptedAbsDiff(
+                plan.exposure[asset],
+                plan.targetBps[asset]
+            );
 
-        plan.drift[asset] = drift;
-        plan.lastRebalanceDelta[asset] = proposedDelta;
-        plan.lastExecutionApproved = FHE.and(thresholdPassed, allocationAllowed);
-        _allowOwnerAndContract(plan.drift[asset]);
-        _allowOwnerAndContract(plan.lastRebalanceDelta[asset]);
-        FHE.allowThis(plan.lastExecutionApproved);
-        FHE.allow(plan.lastExecutionApproved, plan.owner);
+        euint64 threshold =
+            _volatilityAdjustedThreshold(
+                plan
+            );
+
+        euint64 proposedDelta =
+            _sizedEncryptedRebalanceDelta(
+                plan,
+                drift
+            );
+
+        ebool thresholdPassed =
+            FHE.gt(
+                drift,
+                threshold
+            );
+
+        ebool allocationAllowed =
+            FHE.lte(
+                proposedDelta,
+                plan.maximumAllocation
+            );
+
+        plan.drift[asset] =
+            drift;
+
+        plan.lastRebalanceDelta[
+            asset
+        ] =
+            proposedDelta;
+
+        plan.lastExecutionApproved =
+            FHE.and(
+                thresholdPassed,
+                allocationAllowed
+            );
+
+        _allowOwnerAndContract(
+            plan.drift[asset]
+        );
+
+        _allowOwnerAndContract(
+            plan.lastRebalanceDelta[
+                asset
+            ]
+        );
+
+        FHE.allowThis(
+            plan.lastExecutionApproved
+        );
+
+        FHE.allow(
+            plan.lastExecutionApproved,
+            plan.owner
+        );
     }
 
     function _requireExecutable(
         ExecutionPlan storage plan,
         uint256 anyCapabilityMask,
         bool requireEToken
-    ) internal view {
-        if (!plan.active) revert PlanInactive();
-        if (!plan.armed) revert PlanNotArmed();
-        if (requireEToken && plan.marketType != MarketType.ETOKEN) revert WrongMarketType();
-        if (!requireEToken && plan.marketType != MarketType.EASSET) revert WrongMarketType();
-        if ((plan.capabilities & anyCapabilityMask) == 0) revert CapabilityDisabled();
-    }
+    )
+        internal
+        view
+    {
+        if (!plan.active) {
+            revert PlanInactive();
+        }
 
-    function _requireOperational(bool marketPaused, bytes32 marketRef) internal view {
-        if (globalPaused) revert GlobalPause();
-        if (marketPaused || oracleDegraded[marketRef]) revert MarketPaused();
-    }
+        if (!plan.armed) {
+            revert PlanNotArmed();
+        }
 
-    function _setMarketPaused(MarketType marketType, bytes32 marketRef, bool paused) internal {
-        if (marketType == MarketType.ETOKEN) {
-            PoolId poolId = PoolId.wrap(marketRef);
-            if (!eTokenMarkets[poolId].initialized) revert InvalidMarket();
-            eTokenMarkets[poolId].paused = paused;
-        } else if (marketType == MarketType.EASSET) {
-            if (!_eAssetMarkets[marketRef].initialized) revert InvalidMarket();
-            _eAssetMarkets[marketRef].paused = paused;
-        } else {
+        if (
+            requireEToken
+                && plan.marketType
+                    != MarketType.ETOKEN
+        ) {
             revert WrongMarketType();
         }
-    }
 
-    function _requireCapability(ExecutionPlan storage plan, uint256 capability) internal view {
-        if ((plan.capabilities & capability) != capability) revert CapabilityDisabled();
-    }
+        if (
+            !requireEToken
+                && plan.marketType
+                    != MarketType.EASSET
+        ) {
+            revert WrongMarketType();
+        }
 
-    function _settleOrTake(Currency currency, int128 delta) internal {
-        if (delta < 0) {
-            uint256 amount = uint256(uint128(-delta));
-            poolManager.sync(currency);
-            IERC20(Currency.unwrap(currency)).safeTransfer(address(poolManager), amount);
-            poolManager.settle();
-        } else if (delta > 0) {
-            poolManager.take(currency, address(this), uint256(uint128(delta)));
+        if (
+            (
+                plan.capabilities
+                    & anyCapabilityMask
+            )
+                == 0
+        ) {
+            revert CapabilityDisabled();
         }
     }
 
-    function _currencyToToken(Currency currency) internal pure returns (address token) {
-        token = Currency.unwrap(currency);
-        if (token == address(0)) revert NativeTokenNotAllowed();
+    function _requireOperational(
+        bool marketPaused,
+        bytes32 marketRef
+    )
+        internal
+        view
+    {
+        if (globalPaused) {
+            revert GlobalPause();
+        }
+
+        if (
+            marketPaused
+                || oracleDegraded[
+                    marketRef
+                ]
+        ) {
+            revert MarketPaused();
+        }
     }
 
-    function _requireHybridEToken(address token) internal view {
-        if (token.code.length == 0) revert NonHybridEToken();
-        if (!_supportsInterface(token, ERC7984_INTERFACE_ID)) revert NonHybridEToken();
+    function _requireCapability(
+        ExecutionPlan storage plan,
+        uint256 capability
+    )
+        internal
+        view
+    {
+        if (
+            (
+                plan.capabilities
+                    & capability
+            )
+                != capability
+        ) {
+            revert CapabilityDisabled();
+        }
+    }
 
-        // ERC20 has no ERC165 interface. Static-call its mandatory metadata/
-        // accounting surface to reject pure ERC7984 implementations.
-        (bool supplyOk, bytes memory supplyData) = token.staticcall(
-            abi.encodeCall(IERC20.totalSupply, ())
-        );
-        (bool balanceOk, bytes memory balanceData) = token.staticcall(
-            abi.encodeCall(IERC20.balanceOf, (address(this)))
-        );
-        if (!supplyOk || supplyData.length < 32 || !balanceOk || balanceData.length < 32) {
+    /*//////////////////////////////////////////////////////////////
+                       UNISWAP ACCOUNTING
+    //////////////////////////////////////////////////////////////*/
+
+    function _settleOrTake(
+        Currency currency,
+        int128 delta
+    )
+        internal
+    {
+        if (delta < 0) {
+            uint256 amount =
+                uint256(
+                    uint128(
+                        -delta
+                    )
+                );
+
+            poolManager.sync(
+                currency
+            );
+
+            IERC20(
+                Currency.unwrap(
+                    currency
+                )
+            )
+                .safeTransfer(
+                    address(
+                        poolManager
+                    ),
+                    amount
+                );
+
+            poolManager.settle();
+        } else if (
+            delta > 0
+        ) {
+            poolManager.take(
+                currency,
+                address(this),
+                uint256(
+                    uint128(
+                        delta
+                    )
+                )
+            );
+        }
+    }
+
+    function _currencyToToken(
+        Currency currency
+    )
+        internal
+        pure
+        returns (address token)
+    {
+        token =
+            Currency.unwrap(
+                currency
+            );
+
+        if (
+            token
+                == address(0)
+        ) {
+            revert
+                NativeTokenNotAllowed();
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       ASSET VALIDATION
+    //////////////////////////////////////////////////////////////*/
+
+    function _requireHybridEToken(
+        address token
+    )
+        internal
+        view
+    {
+        if (
+            token.code.length == 0
+        ) {
+            revert NonHybridEToken();
+        }
+
+        if (
+            !_supportsInterface(
+                token,
+                ERC7984_INTERFACE_ID
+            )
+        ) {
+            revert NonHybridEToken();
+        }
+
+        (
+            bool supplyOk,
+            bytes memory supplyData
+        ) =
+            token.staticcall(
+                abi.encodeCall(
+                    IERC20.totalSupply,
+                    ()
+                )
+            );
+
+        (
+            bool balanceOk,
+            bytes memory balanceData
+        ) =
+            token.staticcall(
+                abi.encodeCall(
+                    IERC20.balanceOf,
+                    (
+                        address(this)
+                    )
+                )
+            );
+
+        if (
+            !supplyOk
+                || supplyData.length
+                    < 32
+                || !balanceOk
+                || balanceData.length
+                    < 32
+        ) {
             revert NonHybridEToken();
         }
     }
 
-    function _requireEncrypted1155(address token) internal view {
-        if (token.code.length == 0
-            || !_supportsInterface(token, type(IERC1155).interfaceId)
-            || !_supportsInterface(token, ENCRYPTED_1155_INTERFACE_ID)) {
-            revert NonEncryptedERC1155();
+    function _requireEncrypted1155(
+        address token
+    )
+        internal
+        view
+    {
+        if (
+            token.code.length == 0
+                || !_supportsInterface(
+                    token,
+                    type(IERC1155)
+                        .interfaceId
+                )
+                || !_supportsInterface(
+                    token,
+                    ENCRYPTED_1155_INTERFACE_ID
+                )
+        ) {
+            revert
+                NonEncryptedERC1155();
         }
     }
 
-    function _requireERC3475(address bond) internal view {
-        if (bond.code.length == 0 || !_supportsInterface(bond, ERC3475_BACKING_INTERFACE_ID)) {
-            revert NonERC3475Backing();
+    function _requireERC3475(
+        address bond
+    )
+        internal
+        view
+    {
+        if (
+            bond.code.length == 0
+                || !_supportsInterface(
+                    bond,
+                    ERC3475_BACKING_INTERFACE_ID
+                )
+        ) {
+            revert
+                NonERC3475Backing();
         }
     }
 
-    function _supportsInterface(address target, bytes4 interfaceId) internal view returns (bool) {
-        try IERC165(target).supportsInterface(interfaceId) returns (bool supported) {
+    function _supportsInterface(
+        address target,
+        bytes4 interfaceId
+    )
+        internal
+        view
+        returns (bool)
+    {
+        try
+            IERC165(target)
+                .supportsInterface(
+                    interfaceId
+                )
+        returns (
+            bool supported
+        ) {
             return supported;
         } catch {
             return false;
         }
     }
 
-    function _publicDeltaToEncryptedAbs(int128 amount) internal returns (euint64) {
-        uint128 absolute = amount >= 0 ? uint128(amount) : uint128(-amount);
-        return FHE.asEuint64(uint64(absolute));
-    }
+    /*//////////////////////////////////////////////////////////////
+                           FHE HELPERS
+    //////////////////////////////////////////////////////////////*/
 
-    function _encryptedAbsDiff(euint64 a, euint64 b) internal returns (euint64) {
-        ebool aGreater = FHE.gt(a, b);
-        return FHE.select(aGreater, FHE.sub(a, b), FHE.sub(b, a));
-    }
-
-    function _volatilityAdjustedThreshold(ExecutionPlan storage plan)
+    function _publicDeltaToEncryptedAbs(
+        int128 amount
+    )
         internal
         returns (euint64)
     {
-        euint64 volatilityBuffer = FHE.div(plan.volatilityBps, FHE.asEuint64(4));
-        euint64 feeCredit = FHE.div(plan.feeAprBps, FHE.asEuint64(8));
-        euint64 rawThreshold = FHE.add(plan.rebalanceThresholdBps, volatilityBuffer);
-        ebool aboveCredit = FHE.gt(rawThreshold, feeCredit);
+        uint128 absolute =
+            amount >= 0
+                ? uint128(amount)
+                : uint128(-amount);
+
+        return
+            FHE.asEuint64(
+                uint64(
+                    absolute
+                )
+            );
+    }
+
+    function _encryptedAbsDiff(
+        euint64 a,
+        euint64 b
+    )
+        internal
+        returns (euint64)
+    {
+        ebool aGreater =
+            FHE.gt(
+                a,
+                b
+            );
+
+        return FHE.select(
+            aGreater,
+            FHE.sub(
+                a,
+                b
+            ),
+            FHE.sub(
+                b,
+                a
+            )
+        );
+    }
+
+    function _volatilityAdjustedThreshold(
+        ExecutionPlan storage plan
+    )
+        internal
+        returns (euint64)
+    {
+        euint64 volatilityBuffer =
+            FHE.div(
+                plan.volatilityBps,
+                FHE.asEuint64(4)
+            );
+
+        euint64 feeCredit =
+            FHE.div(
+                plan.feeAprBps,
+                FHE.asEuint64(8)
+            );
+
+        euint64 rawThreshold =
+            FHE.add(
+                plan
+                    .rebalanceThresholdBps,
+                volatilityBuffer
+            );
+
+        ebool aboveCredit =
+            FHE.gt(
+                rawThreshold,
+                feeCredit
+            );
+
         return FHE.select(
             aboveCredit,
-            FHE.sub(rawThreshold, feeCredit),
+            FHE.sub(
+                rawThreshold,
+                feeCredit
+            ),
             FHE.asEuint64(1)
         );
     }
 
-    function _sizedEncryptedRebalanceDelta(ExecutionPlan storage plan, euint64 drift)
+    function _sizedEncryptedRebalanceDelta(
+        ExecutionPlan storage plan,
+        euint64 drift
+    )
         internal
         returns (euint64)
     {
-        euint64 weighted = FHE.mul(drift, plan.hedgeIntensityBps);
-        return FHE.div(weighted, FHE.asEuint64(BPS));
+        euint64 weighted =
+            FHE.mul(
+                drift,
+                plan.hedgeIntensityBps
+            );
+
+        return
+            FHE.div(
+                weighted,
+                FHE.asEuint64(
+                    BPS
+                )
+            );
     }
 
-    function _allowOwnerAndContract(euint64 value) internal {
-        FHE.allowThis(value);
-        FHE.allowSender(value);
+    function _allowOwnerAndContract(
+        euint64 value
+    )
+        internal
+    {
+        FHE.allowThis(
+            value
+        );
+
+        FHE.allowSender(
+            value
+        );
     }
+
+    /*//////////////////////////////////////////////////////////////
+                       ERC1155 RECEIVER
+    //////////////////////////////////////////////////////////////*/
 
     function onERC1155Received(
         address,
@@ -1297,8 +3260,15 @@ contract SchrodingerHook is
         uint256,
         uint256,
         bytes calldata
-    ) external pure returns (bytes4) {
-        return IERC1155Receiver.onERC1155Received.selector;
+    )
+        external
+        pure
+        returns (bytes4)
+    {
+        return
+            IERC1155Receiver
+                .onERC1155Received
+                .selector;
     }
 
     function onERC1155BatchReceived(
@@ -1307,17 +3277,33 @@ contract SchrodingerHook is
         uint256[] calldata,
         uint256[] calldata,
         bytes calldata
-    ) external pure returns (bytes4) {
-        return IERC1155Receiver.onERC1155BatchReceived.selector;
+    )
+        external
+        pure
+        returns (bytes4)
+    {
+        return
+            IERC1155Receiver
+                .onERC1155BatchReceived
+                .selector;
     }
 
-    function supportsInterface(bytes4 interfaceId)
+    function supportsInterface(
+        bytes4 interfaceId
+    )
         public
         pure
         override
         returns (bool)
     {
-        return interfaceId == type(IERC1155Receiver).interfaceId
-            || interfaceId == type(IERC165).interfaceId;
+        return
+            interfaceId
+                == type(
+                    IERC1155Receiver
+                ).interfaceId
+                || interfaceId
+                    == type(
+                        IERC165
+                    ).interfaceId;
     }
 }
