@@ -757,9 +757,7 @@ contract SchrodingerHook is
                 .selector;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                               ADMIN
-    //////////////////////////////////////////////////////////////*/
+    // Admin section
 
     function setProtocolModule(
         address module,
@@ -890,9 +888,7 @@ contract SchrodingerHook is
             paused;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       INVENTORY / CUSTODY
-    //////////////////////////////////////////////////////////////*/
+    // Custody and Inventory section
 
     function depositEToken(
         address token,
@@ -1014,9 +1010,7 @@ contract SchrodingerHook is
             );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                        CONFIDENTIAL PLANS
-    //////////////////////////////////////////////////////////////*/
+    // Confidential plans and strategies
 
     function createPlan(
         PlanInput calldata input
@@ -1223,9 +1217,7 @@ contract SchrodingerHook is
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       ETOKEN MARKETS
-    //////////////////////////////////////////////////////////////*/
+    // eMarkets
 
     function createETokenMarket(
         bytes32 planId,
@@ -1852,9 +1844,7 @@ contract SchrodingerHook is
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                         EASSET MARKETS
-    //////////////////////////////////////////////////////////////*/
+    // eAsset Markets
 
     function createEAssetMarket(
         bytes32 planId,
@@ -2283,9 +2273,7 @@ contract SchrodingerHook is
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                          TELLOR V1
-    //////////////////////////////////////////////////////////////*/
+    // Tellor signal integration
 
     function receiveTellorSignal(
         bytes32 marketRef,
@@ -2338,10 +2326,6 @@ contract SchrodingerHook is
             marketRef
         ] = degraded;
     }
-
-    /*//////////////////////////////////////////////////////////////
-                           CORE VIEWS
-    //////////////////////////////////////////////////////////////*/
 
     function getPlanMetadata(
         bytes32 planId
@@ -2420,9 +2404,7 @@ contract SchrodingerHook is
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                     PERMISSIONED POOL INTERNALS
-    //////////////////////////////////////////////////////////////*/
+    //permissioned pools
 
     function _beforeInitializePermissionCheck(
         address,
@@ -2774,9 +2756,7 @@ contract SchrodingerHook is
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       PRIVATE REBALANCING
-    //////////////////////////////////////////////////////////////*/
+    // Private rebalanceing
 
     function _evaluatePrivateRebalance(
         ExecutionPlan storage plan,
@@ -2929,9 +2909,7 @@ contract SchrodingerHook is
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       UNISWAP ACCOUNTING
-    //////////////////////////////////////////////////////////////*/
+    // Uniswap Accounting
 
     function _settleOrTake(
         Currency currency,
@@ -3000,9 +2978,7 @@ contract SchrodingerHook is
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       ASSET VALIDATION
-    //////////////////////////////////////////////////////////////*/
+    // Asset Validation
 
     function _requireHybridEToken(
         address token
@@ -3124,9 +3100,7 @@ contract SchrodingerHook is
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                           FHE HELPERS
-    //////////////////////////////////////////////////////////////*/
+    // FHE Helpers
 
     function _publicDeltaToEncryptedAbs(
         int128 amount
@@ -3250,9 +3224,7 @@ contract SchrodingerHook is
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                       ERC1155 RECEIVER
-    //////////////////////////////////////////////////////////////*/
+    // ERC 1155 Receiver
 
     function onERC1155Received(
         address,
