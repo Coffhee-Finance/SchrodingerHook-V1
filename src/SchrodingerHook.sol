@@ -543,9 +543,7 @@ contract SchrodingerHook is
         });
     }
 
-    /*//////////////////////////////////////////////////////////////
-                    UNISWAP V4 CALLBACKS
-    //////////////////////////////////////////////////////////////*/
+    // Uniswap CallBacks
 
     function beforeInitialize(
         address sender,
